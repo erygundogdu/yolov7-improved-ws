@@ -1,7 +1,7 @@
 # parameters
 nc: 80  # number of classes
 depth_multiple: 1.0  # model depth multiple
-width_multiple: 1.0  # layer channel multiple
+width_multiple: 0.5  # layer channel multiple
 
 # anchors
 anchors:
@@ -133,8 +133,11 @@ head:
    [-1, 1, Conv, [512, 1, 1]], # 101
    
    [75, 1, RepConv, [256, 3, 1]],
+   #[-1,  1, SpatialAttention,     [256,7]], #75 q
    [88, 1, RepConv, [512, 3, 1]],
+   #[-1,  1, SpatialAttention,     [512,7]], #75 q
    [101, 1, RepConv, [1024, 3, 1]],
+   #[-1,  1, SpatialAttention,     [1024,7]], #75 q
 
    [[102,103,104], 1, IDetect, [nc, anchors]],   # Detect(P3, P4, P5)
   ]

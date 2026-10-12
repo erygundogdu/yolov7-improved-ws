@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.general import bbox_iou, bbox_alpha_iou, bbox_nwd, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
 from utils.torch_utils import is_parallel
 
 
@@ -466,7 +466,14 @@ class ComputeLoss:
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                #lbox += (1.0 - iou).mean()  # iou loss
+                nwd = bbox_nwd(pbox.T,tbox[i],x1y1x2y2=False)
+                lbox += (0.65 * (1.0 - nwd) + 0.35 * (1.0 - iou)).mean()  # nwd loss
+                                #lbox+= (1.0 - nwd).mean()  # nwd loss
+                
+                                # Objectness
+                                #####tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                #tobj[b,a,gj,gi] = 0.4 + 0.6*nwd.detach().clamp(0).type(tobj.dtype)
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -476,6 +483,13 @@ class ComputeLoss:
                     t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
                     #t[t==self.cp] = iou.detach().clamp(0).type(t.dtype)
+#                     cls_loss = self.BCEcls(ps[:, 5:], t)  # shape: [n, nc]
+
+# class_w = torch.ones(n, device=device)
+# class_w[tcls[i] == 6] = 3.0  # class 6 için ağırlık, örn 3 kat
+
+# cls_loss = cls_loss * class_w[:, None]
+# lcls += cls_loss.mean()
                     lcls += self.BCEcls(ps[:, 5:], t)  # BCE
 
                 # Append targets to text file
@@ -559,6 +573,7 @@ class ComputeLossOTA:
         super(ComputeLossOTA, self).__init__()
         device = next(model.parameters()).device  # get model device
         h = model.hyp  # hyperparameters
+        self.loss_w = torch.tensor([1.0 , 3.0, 1.0],device=device) 
 
         # Define criteria
         BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
@@ -576,6 +591,7 @@ class ComputeLossOTA:
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        #self.balance = torch.tensor([4.0, 2.0, 1.0]) / 7.0 
         for k in 'na', 'nc', 'nl', 'anchors', 'stride':
             setattr(self, k, getattr(det, k))
 
@@ -604,11 +620,15 @@ class ComputeLossOTA:
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
                 iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                nwd = bbox_nwd(pbox.T,selected_tbox,x1y1x2y2=False)
+                #lbox += (1.0 - iou).mean()  # iou loss
+                lbox += (0.65 * (1.0 - nwd) + 0.35 * (1.0 - iou)).mean()  # nwd loss
+                #lbox+= (1.0 - nwd).mean()  # nwd loss
 
                 # Objectness
-                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
-
+                #####tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                tobj[b,a,gj,gi] = 0.4 + 0.6*nwd.detach().clamp(0).type(tobj.dtype)  # nwd ratio
+                #tobj[b, a, gj, gi] = 1.0
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -633,6 +653,7 @@ class ComputeLossOTA:
         bs = tobj.shape[0]  # batch size
 
         loss = lbox + lobj + lcls
+        #loss  = self.loss_w[0] * lbox + self.loss_w[1]*lobj + self.loss_w[2] * lcls
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets, imgs):

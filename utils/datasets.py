@@ -82,12 +82,31 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
+    shuffle = sampler is None and augment and not rect and not image_weights
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
+                        shuffle=shuffle,
                         sampler=sampler,
                         pin_memory=True,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    if augment:
+        debug_sampler = sampler if sampler is not None else dataloader.batch_sampler.sampler
+        shuffled_indices = list(iter(debug_sampler))
+
+        flat_indices = []
+        for batch in shuffled_indices:
+            if isinstance(batch, (list, tuple)):
+                flat_indices.extend(batch)
+            else:
+                flat_indices.append(batch)
+
+        debug_dir = Path('runs') / 'debug'
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(debug_dir / 'train_shuffle_order.txt', 'w') as f:
+            for idx in flat_indices:
+                f.write(dataset.img_files[idx] + '\n')
     return dataloader, dataset
 
 
@@ -389,7 +408,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
+            cache, exists = torch.load(cache_path,weights_only=False), True  # load
             #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
             #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
@@ -1036,7 +1055,8 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     R = np.eye(3)
     a = random.uniform(-degrees, degrees)
     # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1.1 + scale)
+    ########################CHANGED IT TO SCALE 1]
+    s = random.uniform(1 - scale, 1.1 + scale) 
     # s = 2 ** random.uniform(-scale, scale)
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 

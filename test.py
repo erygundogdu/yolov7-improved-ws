@@ -17,6 +17,52 @@ from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
+class DetectHook:
+    def __init__(self, *args, **kwargs):
+        self.maps = None
+    def __call__(self, module, inputs):
+        return inputs
+       # _backward_hooks = {}
+        #_forward_hooks = {}
+        #_forward_pre_hooks = {}
+        #def forward (self, x, *args, **kwargs):
+         #   return x
+    #def forward (self, *args, **kwargs):
+     #   if len(args) == 1:
+     #       return args[0]
+      #  return args
+def meta_neck_pre_hook(*args, **kwargs):
+    return None
+
+
+def small_object_stats(pred, labels, boxes, iouv, small_size):
+    """Area-restricted matches in original-image pixels; ignore larger objects."""
+    small_targets = (boxes[:, 2:] - boxes[:, :2]).prod(1) < small_size ** 2
+    small_predictions = (pred[:, 2:4] - pred[:, :2]).prod(1) < small_size ** 2
+    ious = box_iou(pred[:, :4], boxes)
+    same_class = pred[:, 5:6] == labels[:, 0]
+    stats = []
+    for threshold in iouv:
+        correct = torch.zeros(len(pred), dtype=torch.bool, device=pred.device)
+        ignore = ~small_predictions.clone()
+        matched = torch.zeros(len(labels), dtype=torch.bool, device=pred.device)
+        for pi in pred[:, 4].argsort(descending=True).tolist():
+            candidates = same_class[pi] & ~matched & (ious[pi] >= threshold)
+            # Prefer small targets, then match larger targets only to ignore them.
+            eligible = candidates & small_targets
+            if not eligible.any():
+                eligible = candidates & ~small_targets
+            ti = eligible.nonzero(as_tuple=False).view(-1)
+            if ti.numel():
+                target = ti[ious[pi, ti].argmax()]
+                matched[target] = True
+                correct[pi] = small_targets[target]
+                ignore[pi] = ~small_targets[target]
+        keep = ~ignore
+        stats.append((correct[keep, None].cpu(), pred[keep, 4].cpu(),
+                      pred[keep, 5].cpu(), labels[small_targets, 0].cpu()))
+    return stats
+
 
 def test(data,
          weights=None,
@@ -40,7 +86,10 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         small_size=None):
+    if small_size is not None and (not np.isfinite(small_size) or small_size <= 0):
+        raise ValueError('small_size must be a positive finite pixel size')
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -101,6 +150,7 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    small_stats = [[] for _ in range(niou)]
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -132,6 +182,15 @@ def test(data,
             tcls = labels[:, 0].tolist() if nl else []  # target class
             path = Path(paths[si])
             seen += 1
+
+            if small_size is not None:
+                small_pred = pred.clone()
+                small_boxes = xywh2xyxy(labels[:, 1:5])
+                scale_coords(img[si].shape[1:], small_pred[:, :4], shapes[si][0], shapes[si][1])
+                scale_coords(img[si].shape[1:], small_boxes, shapes[si][0], shapes[si][1])
+                for bucket, values in zip(small_stats, small_object_stats(
+                        small_pred, labels, small_boxes, iouv, small_size)):
+                    bucket.append(values)
 
             if len(pred) == 0:
                 if nl:
@@ -237,6 +296,33 @@ def test(data,
         for i, c in enumerate(ap_class):
             print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
 
+    if small_size is not None:
+        small_ap = np.full((nc, niou), np.nan)
+        small_pr = np.full((nc, 2), np.nan)
+        small_counts = np.zeros(nc, dtype=np.int64)
+        for j, bucket in enumerate(small_stats):
+            if not bucket:
+                continue
+            values = [np.concatenate(x, 0) for x in zip(*bucket)]
+            small_counts = np.bincount(values[3].astype(np.int64), minlength=nc)
+            if small_counts.sum():
+                class_p, class_r, class_ap, _, classes = ap_per_class(*values, v5_metric=v5_metric)
+                small_ap[classes, j] = class_ap[:, 0]
+                if j == 0:  # P/R at IoU 0.5 and the best mean-F1 confidence, as in the main report
+                    small_pr[classes] = np.column_stack((class_p, class_r))
+        print(f'\nSmall objects: bbox area < {small_size:g}^2 = {small_size ** 2:g} px^2 '
+              '(original image pixels)')
+        small_pf = '%20s' + ' %13s' * 6
+        print(small_pf % ('Class', 'Images', 'Small labels', 'P', 'R', 'APsmall@.5', 'APsmall@.5:.95'))
+        valid = small_counts > 0
+        small_metrics = np.column_stack((small_pr, small_ap[:, 0], small_ap.mean(1)))
+        mean_metrics = small_metrics[valid].mean(0) if valid.any() else None
+        rows = [('all', small_counts.sum(), mean_metrics)]
+        rows += [(names[c], small_counts[c], small_metrics[c] if valid[c] else None) for c in range(nc)]
+        for name, count, scores in rows:
+            formatted = [f'{score:.3g}' for score in scores] if scores is not None else ['N/A'] * 4
+            print(small_pf % (name, seen, count, *formatted))
+
     # Print speeds
     t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
     if not training:
@@ -291,10 +377,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov7.pt', help='model.pt path(s)')
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='*.data path')
-    parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
+    parser.add_argument('--batch-size', type=int, default=6, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
+    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
     parser.add_argument('--task', default='val', help='train, val, test, speed or study')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
@@ -309,7 +395,11 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--small-size', type=float, default=None,
+                        help='report AP small for bbox area < SIZE^2 in original image pixels (e.g. 50)')
     opt = parser.parse_args()
+    if opt.small_size is not None and (not np.isfinite(opt.small_size) or opt.small_size <= 0):
+        parser.error('--small-size must be a positive finite pixel size')
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
@@ -330,12 +420,14 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
+             v5_metric=opt.v5_metric,
+             small_size=opt.small_size
              )
 
     elif opt.task == 'speed':  # speed benchmarks
         for w in opt.weights:
-            test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45, save_json=False, plots=False, v5_metric=opt.v5_metric)
+            test(opt.data, w, opt.batch_size, opt.img_size, 0.25, 0.45, save_json=False, plots=False,
+                 v5_metric=opt.v5_metric, small_size=opt.small_size)
 
     elif opt.task == 'study':  # run over a range of settings and save/plot
         # python test.py --task study --data coco.yaml --iou 0.65 --weights yolov7.pt
@@ -346,7 +438,7 @@ if __name__ == '__main__':
             for i in x:  # img-size
                 print(f'\nRunning {f} point {i}...')
                 r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
-                               plots=False, v5_metric=opt.v5_metric)
+                               plots=False, v5_metric=opt.v5_metric, small_size=opt.small_size)
                 y.append(r + t)  # results and times
             np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')

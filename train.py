@@ -28,17 +28,49 @@ from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
-    check_requirements, print_mutation, set_logging, one_cycle, colorstr
+    check_requirements, print_mutation, set_logging, one_cycle, colorstr, freeze_bn
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
+#from debug import copy_detect_head_class
 logger = logging.getLogger(__name__)
+class DetectHook:
+    def __init__(self, *args, **kwargs):
+        self.maps = None
+    def __call__(self, module, inputs):
+        return inputs
+       # _backward_hooks = {}
+        #_forward_hooks = {}
+        #_forward_pre_hooks = {}
+        #def forward (self, x, *args, **kwargs):
+         #   return x
+    #def forward (self, *args, **kwargs):
+     #   if len(args) == 1:
+     #       return args[0]
+      #  return args
+def meta_neck_pre_hook(*args, **kwargs):
+    return None
+
+def configure_training_options(opt):
+    for name, default in [('kd_flag', False), ('teacher_weights', ''), ('bn_l1', False), ('bn_lambda', 1e-3)]:
+        if not hasattr(opt, name):
+            setattr(opt, name, default)
+    if not math.isfinite(opt.bn_lambda) or opt.bn_lambda < 0:
+        raise ValueError('--bn-lambda must be finite and nonnegative')
+    if opt.kd_flag:
+        if not opt.teacher_weights:
+            raise ValueError('--kd_flag requires --teacher-weights PATH')
+        teacher_path = Path(opt.teacher_weights).expanduser()
+        if not teacher_path.is_file():
+            raise ValueError(f'Teacher checkpoint does not exist: {teacher_path}')
+        opt.teacher_weights = str(teacher_path.resolve())
 
 
 def train(hyp, opt, device, tb_writer=None):
+    configure_training_options(opt)
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
@@ -68,7 +100,7 @@ def train(hyp, opt, device, tb_writer=None):
     loggers = {'wandb': None}  # loggers dict
     if rank in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
-        run_id = torch.load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
+        run_id = torch.load(weights, map_location=device,weights_only=False).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
         wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
         loggers['wandb'] = wandb_logger.wandb
         data_dict = wandb_logger.data_dict
@@ -84,12 +116,19 @@ def train(hyp, opt, device, tb_writer=None):
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        ckpt = torch.load(weights, map_location=device,weights_only=False)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
+        # if opt.copy_head:
+        #     src_head = ckpt["model"].model[-1]
+        #     dst_head = model.model[-1]
+        #     #copy_detect_head_class(src_head, dst_head,src_cls=1,dst_cls=0)
+        #     print("######Copying Head Cls Params#############")
+        if opt.freeze_bn:
+            freeze_bn(model)
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
@@ -98,6 +137,7 @@ def train(hyp, opt, device, tb_writer=None):
     train_path = data_dict['train']
     test_path = data_dict['val']
 
+
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
     for k, v in model.named_parameters():
@@ -105,7 +145,11 @@ def train(hyp, opt, device, tb_writer=None):
         if any(x in k for x in freeze):
             print('freezing %s' % k)
             v.requires_grad = False
-
+    model_t = None
+    if opt.kd_flag:
+        from kd_train import loss_kd, get_teacher
+        model_t = get_teacher(opt.teacher_weights, device=device)
+    
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
@@ -222,7 +266,7 @@ def train(hyp, opt, device, tb_writer=None):
             assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
         if epochs < start_epoch:
             logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (weights, ckpt['epoch'], epochs))
+                        (weights, ckpt['epoch'], epochs))     
             epochs += ckpt['epoch']  # finetune additional epochs
 
         del ckpt, state_dict
@@ -231,6 +275,7 @@ def train(hyp, opt, device, tb_writer=None):
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
+    print(model.stride)
 
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
@@ -306,6 +351,8 @@ def train(hyp, opt, device, tb_writer=None):
     torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if opt.freeze_bn:
+            freeze_bn(model)
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -324,12 +371,14 @@ def train(hyp, opt, device, tb_writer=None):
         # Update mosaic border
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
         mloss = torch.zeros(4, device=device)  # mean losses
+        mkd = torch.zeros(3, device=device)  # mean kd losses: obj, box, cls
+      
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
+        
+        logger.info(('\n' + '%10s' * 11) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'kd_obj', 'kd_box', 'kd_cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
@@ -359,10 +408,30 @@ def train(hyp, opt, device, tb_writer=None):
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
+                
+                #lambda_yolo = torch.tensor([1],device=device,dtype=imgs.dtype)
+                #lambda_kd = torch.tensor([0.8],device=device,dtype=imgs.dtype)
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
+                    yolo_loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)
                 else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    yolo_loss, loss_items = compute_loss(pred, targets.to(device))
+                bn_l1 = 0.0
+                if opt.bn_l1:
+                    for m in model.modules():
+                        if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)) and m.weight is not None:
+                            bn_l1 += m.weight.abs().sum()
+
+                loss = yolo_loss + opt.bn_lambda * bn_l1
+                kd_items = torch.zeros(3, device=device, dtype=loss_items.dtype)
+
+                if opt.kd_flag:
+                    with torch.no_grad():
+                        _, pred_t = model_t(imgs)
+                    kd_loss_lst, kd_loss = loss_kd(pred, pred_t)
+                    loss = 0.30*yolo_loss + 0.70 * kd_loss + opt.bn_lambda * bn_l1
+                    kd_items = torch.stack([x.detach().reshape(-1)[0].to(device=device, dtype=loss_items.dtype) for x in kd_loss_lst])
+                    
+                    #loss, loss_items = compute_loss(pred, targets.to(device))
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -382,11 +451,11 @@ def train(hyp, opt, device, tb_writer=None):
             # Print
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mkd = (mkd * i + kd_items) / (i + 1)  # update mean kd losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-                s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                s = ('%10s' * 2 + '%10.4g' * 9) % (
+                    '%g/%g' % (epoch, epochs - 1), mem, mloss[0], mloss[1], mloss[2], mkd[0], mkd[1], mkd[2], mloss[3], targets.shape[0], imgs.shape[-1])
                 pbar.set_description(s)
-
                 # Plot
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
@@ -429,6 +498,8 @@ def train(hyp, opt, device, tb_writer=None):
             # Write
             with open(results_file, 'a') as f:
                 f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
+            if plots: ###aded plot after each epoch
+                plot_results(save_dir=save_dir)
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
@@ -562,7 +633,20 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--freeze_bn', action='store_true', help='freeze BatchNorm layers from loaded base weights')
+    parser.add_argument('--copy_head', action='store_true', help='copy detection head classes')
+    parser.add_argument('--kd_flag', action='store_true')
+    parser.add_argument('--teacher-weights', '--teacher_weights', default=argparse.SUPPRESS, type=str,
+                        help='teacher checkpoint path, required with --kd_flag')
+    parser.add_argument('--bn-l1', '--bn_l1', default=argparse.SUPPRESS, action='store_true',
+                        help='enable L1 regularization of BatchNorm scale weights')
+    parser.add_argument('--bn-lambda', '--bn_lambda', default=argparse.SUPPRESS, type=float,
+                        help='BN L1 coefficient (default: 0.001; requires --bn-l1)')
     opt = parser.parse_args()
+    training_overrides = {name: getattr(opt, name) for name in ('teacher_weights', 'bn_l1', 'bn_lambda')
+                          if hasattr(opt, name)}
+    if opt.kd_flag:
+        training_overrides['kd_flag'] = True
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
@@ -589,6 +673,13 @@ if __name__ == '__main__':
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+
+    for name, value in training_overrides.items():
+        setattr(opt, name, value)
+    try:
+        configure_training_options(opt)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # DDP mode
     opt.total_batch_size = opt.batch_size

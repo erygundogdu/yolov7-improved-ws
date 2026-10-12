@@ -29,7 +29,12 @@ pd.options.display.max_columns = 10
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
 os.environ['NUMEXPR_MAX_THREADS'] = str(min(os.cpu_count(), 8))  # NumExpr max threads
 
-
+def freeze_bn(model):
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+            m.weight.requires_grad = False
+            m.bias.requires_grad = False
 def set_logging(rank=-1):
     logging.basicConfig(
         format="%(message)s",
@@ -386,8 +391,23 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
     else:
         return iou  # IoU
 
+def bbox_nwd(box1, box2, x1y1x2y2=False, eps=1e-9):
+    box2 = box2.T ## 4,N
+    box2x, box2y, box2w, box2h = box2[0], box2[1], box2[2], box2[3]
+    box1x, box1y, box1w, box1h = box1[0], box1[1], box1[2], box1[3]
 
+    center_distance = ((box1x - box2x) ** 2 +(box1y - box2y) ** 2)
+    size_distance = (((box1w - box2w) / 2) ** 2 +((box1h - box2h) / 2) ** 2)
 
+    wasserstein_2 = center_distance + size_distance
+
+    # Wasserstein distance, [N]
+    wasserstein = torch.sqrt(wasserstein_2 + eps)
+
+    # normalized similarity, [N]
+    nwd = torch.exp(-wasserstein / 6.0)
+
+    return nwd
 
 def bbox_alpha_iou(box1, box2, x1y1x2y2=False, GIoU=False, DIoU=False, CIoU=False, alpha=2, eps=1e-9):
     # Returns tsqrt_he IoU of box1 to box2. box1 is 4, box2 is nx4
@@ -799,7 +819,7 @@ def non_max_suppression_kpt(prediction, conf_thres=0.25, iou_thres=0.45, classes
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
-    x = torch.load(f, map_location=torch.device('cpu'))
+    x = torch.load(f, map_location=torch.device('cpu'),weights_only=False)
     if x.get('ema'):
         x['model'] = x['ema']  # replace model with ema
     for k in 'optimizer', 'training_results', 'wandb_id', 'ema', 'updates':  # keys

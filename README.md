@@ -1,4 +1,156 @@
-# Official YOLOv7
+# YOLOv7 Improved Workspace
+
+This repository extends YOLOv7 with NWD box loss, knowledge distillation,
+BatchNorm L1 sparsity regularization, sliced inference, and two-stage detection.
+The original YOLOv7 documentation and attribution are retained below. Its reported
+benchmark results are upstream results, not measurements of these modifications.
+
+## Added workflows
+
+| Feature | Implementation | Configuration |
+| --- | --- | --- |
+| NWD + CIoU box loss | [utils/loss.py](utils/loss.py), [utils/general.py](utils/general.py) | Enabled in `ComputeLoss` and `ComputeLossOTA` |
+| Knowledge distillation | [train.py](train.py), [kd_train.py](kd_train.py) | `--kd_flag --teacher-weights PATH` |
+| BN L1 sparsity | [train.py](train.py) | `--bn-l1 --bn-lambda 0.001` |
+| SAHI-style sliced inference | [sahi/detect_sahi.py](sahi/detect_sahi.py) | `--slice-size`, overlap options, `--draw-windows` |
+| Sliced evaluation | [sahi/test_sahi.py](sahi/test_sahi.py) | `--sahi` |
+| Detector + binary classifier | [detect_two_stage/](detect_two_stage/) | Crop preparation, dataset generation, training, export, inference |
+
+Run the commands below from the repository root. Replace example dataset and
+checkpoint paths with your own. Detector dataset YAML files describe image paths,
+class count, and class names; the images and labels must be supplied separately.
+
+### NWD loss
+
+The box-regression loss in both `ComputeLoss` and `ComputeLossOTA` combines
+Normalized Wasserstein Distance (NWD) similarity with Complete IoU (CIoU):
+
+```text
+L_box = mean(0.65 * (1 - NWD) + 0.35 * (1 - CIoU))
+```
+
+`bbox_nwd()` compares box centers and half-width/half-height differences, then
+computes `exp(-distance / 6.0)`. Boxes are passed in feature-grid coordinates.
+The coefficients and normalization constant are currently defined in the code;
+there is no NWD command-line switch. `loss_ota: 0` in the hyperparameter YAML
+selects `ComputeLoss`; `loss_ota: 1` selects `ComputeLossOTA`. Both include NWD.
+The standard path retains CIoU-based objectness targets, while the OTA path uses
+`0.4 + 0.6 * NWD` for matched objectness targets. Other loss classes are not
+covered by this NWD modification.
+
+### Knowledge distillation
+
+```powershell
+python train.py --weights "student.pt" --data "data/your_dataset.yaml" --hyp "data/hyp.scratch.p5.yaml" --img-size 640 640 --device 0 --kd_flag --teacher-weights "teacher.pt" --name "kd_training"
+```
+
+The teacher is loaded only when `--kd_flag` is enabled. Its checkpoint must contain
+a `model` entry. Teacher parameters are frozen, the teacher runs in evaluation
+mode without gradients, and only the student is optimized.
+
+`kd_train.py` compares corresponding raw detection-head outputs using objectness
+and classification BCE losses plus a Smooth L1 box loss. Box and class terms use
+positions where teacher objectness exceeds 0.20. The training objective is:
+
+```text
+L = 0.30 * L_YOLO + 0.70 * L_KD
+```
+
+Teacher and student must have compatible detection-head tensor shapes, anchor/grid
+layouts, and class ordering; this implementation does not align mismatched heads.
+The KD helper currently allocates its default loss weights on CUDA device 0, so
+the example uses `--device 0`; CPU and multi-device KD need device-handling changes.
+The teacher path is saved in the run options. On resume, an explicit
+`--teacher-weights` overrides the saved path.
+
+### BN L1 sparsity regularization
+
+```powershell
+python train.py --weights "student.pt" --data "data/your_dataset.yaml" --hyp "data/hyp.scratch.p5.yaml" --bn-l1 --bn-lambda 0.001 --name "bn_sparse"
+```
+
+`--bn-l1` adds `bn_lambda * sum(abs(gamma))` over BatchNorm2d and SyncBatchNorm scale
+weights. It is disabled by default; the default coefficient is `0.001`.
+This encourages small BN scales but does not itself remove channels or produce
+a pruned model. Scale parameters must remain trainable for the penalty to update
+them. The coefficient must be finite and nonnegative.
+
+BN L1 can also be combined with KD:
+
+```powershell
+python train.py --weights "student.pt" --data "data/your_dataset.yaml" --device 0 --kd_flag --teacher-weights "teacher.pt" --bn-l1 --bn-lambda 0.001 --name "kd_bn_sparse"
+```
+
+The combined objective is `0.30 * L_YOLO + 0.70 * L_KD + bn_lambda * sum(abs(gamma))`.
+
+### SAHI-style sliced detection and evaluation
+
+Detection runs the model on overlapping image crops, maps detections back to the
+original image, and merges them with NMS. This is implemented directly in the repo
+and does not require the external SAHI package.
+
+```powershell
+python sahi/detect_sahi.py --weights "best_vehicle_640.pt" --source "path/to/images" --img-size 640 --slice-size 640 --slice-overlap-h 0.2 --slice-overlap-w 0.2 --draw-windows
+```
+
+`--draw-windows` overlays red crop boundaries and green merged detections, replacing
+the former `detectv1.py` debugging script. Omit the flag for normal visualization.
+Detection outputs default to `sahi/runs/exp`, incrementing for subsequent runs.
+`--project` and `--name` override the output location.
+
+```powershell
+python sahi/test_sahi.py --weights "best_vehicle_640.pt" --data "data/your_dataset.yaml" --sahi --batch-size 1
+```
+
+Evaluation's `--sahi` mode uses a fixed 1664 x 1664 canvas with nine 640 x 640
+windows at offsets 0, 512, and 1024. It does not inherit the detector's configurable
+slice settings. Without `--sahi`, evaluation uses ordinary full-image inference.
+See [sahi/README.md](sahi/README.md) for details.
+
+### Two-stage detection
+
+The first stage proposes boxes with YOLOv7. The second stage expands each box,
+resizes the crop to 160 x 160, and applies a ResNet18-based binary classifier with
+multi-scale feature fusion. Inference annotates each detection with a `yes`/`no`
+decision at sigmoid probability 0.5 and saves classifier Grad-CAM visualizations.
+Negative classifications are annotated rather than removed from the output.
+
+Start with an input directory containing `images/` and matching YOLO `labels/`:
+
+```powershell
+python detect_two_stage/prepare_class_data.py --input "path/to/input_dataset"
+```
+
+This extracts class-0 boxes into `detect_two_stage/crops/`. Sort the crops into
+`target/` and `non_target/` subfolders according to the intended binary task.
+If an entire input belongs to one binary class, `--class-name target` or
+`--class-name non_target` saves directly into that class folder.
+
+```powershell
+python detect_two_stage/generate_dataset.py --input "detect_two_stage/crops" --augment 2
+python detect_two_stage/classifier.py
+python detect_two_stage/export_onnx_classifier.py
+python detect_two_stage/detect_two_stage.py --det-weights "best.pt" --source "path/to/images"
+```
+
+Dataset generation creates `detect_two_stage/dataset/{train,val,test}`, each with
+`target/` and `non_target/` classes. It defaults to an 80/10/10 split with seed 42,
+keeps crops from the same source filename together, and augments only training
+images. At least three independent source images per class are required.
+
+Classifier training reads `resnet18_imagenet.pth` from the repository root and saves
+`detect_two_stage/yeni.pt`. Export writes `detect_two_stage/classifier.onnx`.
+Inference defaults to that `.pt` checkpoint; `--cls-weights` selects another one.
+Detection images and Grad-CAM outputs default to `runs/detect_two_stage/exp`.
+The classifier currently selects checkpoints by training accuracy; validation and
+test splits are loaded but not evaluated by its training loop.
+
+Grad-CAM requires the `grad-cam` package, and classifier export requires ONNX
+dependencies in addition to the repository environment. See
+[detect_two_stage/README.md](detect_two_stage/README.md) for dataset layout,
+single-image augmentation, and output options.
+
+## Original YOLOv7 documentation
 
 Implementation of paper - [YOLOv7: Trainable bag-of-freebies sets new state-of-the-art for real-time object detectors](https://arxiv.org/abs/2207.02696)
 

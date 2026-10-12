@@ -372,6 +372,7 @@ def profile_idetection(start=0, stop=0, labels=(), save_dir=''):
 
     ax[1].legend()
     plt.savefig(Path(save_dir) / 'idetection_profile.png', dpi=200)
+    plt.close(fig)
 
 
 def plot_results_overlay(start=0, stop=0):  # from utils.plots import *; plot_results_overlay()

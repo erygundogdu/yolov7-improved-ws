@@ -44,8 +44,12 @@ def detect(save_img=False):
     # Second-stage classifier
     classify = False
     if classify:
-        modelc = load_classifier(name='resnet101', n=2)  # initialize
-        modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model']).to(device).eval()
+        #modelc = load_classifier(name='resnet101', n=2)  # initialize
+        #modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model']).to(device).eval()
+        modelc = build_model(num_classes=2)
+        modelc.load_state_dict(torch.load("best_classifier.pt", map_location=device))
+        modelc = model.to(device)
+        modelc.eval()
 
     # Set Dataloader
     vid_path, vid_writer = None, None

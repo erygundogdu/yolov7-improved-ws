@@ -100,14 +100,23 @@ class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
+        self.c_in = c1
+        self.c_out = c2
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        #self.conv_grouped = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=math.gcd(c1, c2), bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.LeakyReLU(0.1) if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
+        ##if self.c_in == self.c_out:
+
+          ##  return x + self.act(self.bn(self.conv_grouped(x)))
         return self.act(self.bn(self.conv(x)))
 
     def fuseforward(self, x):
+        ##if self.c_in == self.c_out:
+          ##      return x + self.act(self.conv_grouped(x))
+
         return self.act(self.conv(x))
     
 
@@ -255,7 +264,140 @@ class Ghost(nn.Module):
         return self.conv(x) + self.shortcut(x)
 
 ##### end of basic #####
+class SAM(nn.Module):
+    def __init__(self, c1,c2, kernel_size = 7):
+        super().__init__()
+        pad =  (kernel_size-1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False)
+        self.act = nn.Sigmoid()
+        self.max_kernel = nn.Parameter(torch.zeros(1,c2,1,1))
+    def forward(self,x): ##x is the current feature map
+        B,C,H,W = x.shape
+        w = self.max_kernel
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)  
+        max_map = F.conv2d(x, w ,bias=None, stride = 1, padding= 0)
+        avg_k = x.new_full((1, C, 1, 1), 1.0 / C)
+        avg_map = F.conv2d(x, avg_k ,bias=None, stride = 1, padding= 0)
+        a = torch.cat([avg_map, max_map], dim=1)
+        attn = self.act(self.conv(a))
+        return x * attn    
+class SpatialAttention(nn.Module):
+    def __init__(self, c1,c2, kernel_size = 7):
+        super().__init__()
+        pad =  (kernel_size-1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False)
+        self.act = nn.Sigmoid()
+        self.max_kernel = nn.Parameter(torch.zeros(1,c2,1,1))
+    def forward(self,x): ##x is the current feature map
+        B,C,H,W = x.shape
+        w = self.max_kernel
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)  
+        max_map = F.conv2d(x, w ,bias=None, stride = 1, padding= 0)
+        avg_k = x.new_full((1, C, 1, 1), 1.0 / C)
+        avg_map = F.conv2d(x, avg_k ,bias=None, stride = 1, padding= 0)
+        a = torch.cat([avg_map, max_map], dim=1)
+        attn = self.act(self.conv(a))
+        return (x * attn) + ((1-attn) * x)
+class SpatialAttention(nn.Module): 
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False)
+        self.act = nn.Sigmoid()
+        self.register_buffer('avg_w', None)
+        self.max_like = None
+    def build(self, C, device, dtype):
+        if self.avg_w is None or self.avg_w.shape[1] != C:
+            w = torch.full((1,C,1,1), 1.0 / C, device = device, dtype = dtype)
+            self.register_buffer('avg_w', w)
+        if (self.max_like is None) or (self.max_like.shape[1] != C):
+            self.max_like = nn.Parameter(torch.zeros(1,C,1,1, device=device, dtype=dtype))
+      
+    def forward(self, x):
+        B,C,H,W = x.shape
+        self.build(C, x.device, x.dtype)
+        avg_out = F.conv2d(x, self.avg_w, bias  =None, stride = 1, padding= 0)
+        max_like_out = F.conv2d(x, self.max_like, bias  =None, stride = 1, padding= 0)
+        a = torch.cat([avg_out, max_like_out], dim=1)
+        attn = self.act(self.conv(a))
 
+        return x * attn
+
+class SAM1(nn.Module):  # Spatial Attention (CBAM-style)
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=pad, bias=False)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        a = torch.cat([avg, mx], dim=1)   # [B,2,H,W]
+        attn = self.act(self.conv(a))     # [B,1,H,W]
+        return x * attn
+class SPDConv(nn.Module):
+    def __init__(self, c1, c2, k=3, s=2, p=None, g=1, act=True):
+        super().__init__()
+        if s != 2:
+            raise ValueError('SPDConv supports only a downsampling factor of 2')
+        self.spd = ReOrg()
+        self.conv = Conv(c1 * 4, c2, k, s=1, p=p, g=g, act=act)
+
+    def forward(self, x):
+        return self.conv(self.spd(x))
+
+class DWTA2(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.c1 = c1
+        self.c2 = c2
+
+        kernel = torch.tensor([
+            [[[1, -1], [1, -1]]],
+            [[[1, 1], [-1, -1]]],
+            [[[1, -1], [-1, -1]]]
+        ], dtype=torch.float32) / 2.0
+        self.register_buffer('wavelet_kernel', kernel)
+
+        self.attention_conv = nn.Sequential(
+            nn.Conv2d(c1 * 3, c1, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1, groups=c1, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.LeakyReLU(0.1)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        if h % 2 != 0 or w % 2 != 0:
+            pad_h = h % 2
+            pad_w = w % 2
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            _, _, h, w = x.shape
+
+        x_reshaped = x.view(b * c, 1, h, w)
+        dwt_features = F.conv2d(x_reshaped, self.wavelet_kernel, stride=2)
+        dwt_features = dwt_features.view(b, c * 3, h // 2, w // 2)
+
+        attn_map = self.attention_conv(dwt_features)
+        attn_map_upsampled = F.interpolate(
+            attn_map,
+            size=(h, w),
+            mode='bilinear',
+            align_corners=False
+        )
+        out = x * attn_map_upsampled
+        return self.out_conv(out)
 
 ##### cspnet #####
 
