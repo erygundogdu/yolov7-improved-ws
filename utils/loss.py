@@ -627,7 +627,7 @@ class ComputeLossOTA:
 
                 # Objectness
                 #####tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
-                tobj[b,a,gj,gi] = 0.4 + 0.6*nwd.detach().clamp(0).type(tobj.dtype)  # nwd ratio
+                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # nwd ratio
                 #tobj[b, a, gj, gi] = 1.0
                 # Classification
                 selected_tcls = targets[i][:, 1].long()

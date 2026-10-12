@@ -12,6 +12,7 @@ benchmark results are upstream results, not measurements of these modifications.
 | NWD + CIoU box loss | [utils/loss.py](utils/loss.py), [utils/general.py](utils/general.py) | Enabled in `ComputeLoss` and `ComputeLossOTA` |
 | Knowledge distillation | [train.py](train.py), [kd_train.py](kd_train.py) | `--kd_flag --teacher-weights PATH` |
 | BN L1 sparsity | [train.py](train.py) | `--bn-l1 --bn-lambda 0.001` |
+| Added network modules | [models/common.py](models/common.py) | Spatial attention, `SPDConv`, and `DWTA2` |
 | SAHI-style sliced inference | [sahi/detect_sahi.py](sahi/detect_sahi.py) | `--slice-size`, overlap options, `--draw-windows` |
 | Sliced evaluation | [sahi/test_sahi.py](sahi/test_sahi.py) | `--sahi` |
 | Detector + binary classifier | [detect_two_stage/](detect_two_stage/) | Crop preparation, dataset generation, training, export, inference |
@@ -34,9 +35,20 @@ computes `exp(-distance / 6.0)`. Boxes are passed in feature-grid coordinates.
 The coefficients and normalization constant are currently defined in the code;
 there is no NWD command-line switch. `loss_ota: 0` in the hyperparameter YAML
 selects `ComputeLoss`; `loss_ota: 1` selects `ComputeLossOTA`. Both include NWD.
-The standard path retains CIoU-based objectness targets, while the OTA path uses
-`0.4 + 0.6 * NWD` for matched objectness targets. Other loss classes are not
-covered by this NWD modification.
+Both paths use CIoU-based matched objectness targets:
+`tobj = (1 - gr) + gr * clamp(CIoU.detach(), min=0)`. NWD contributes to box
+regression, not the objectness target. Other loss classes are not covered by this
+NWD modification.
+
+### Added modules in common.py
+
+- **Spatial attention (`SAM` / `SpatialAttention`):** convolution-based channel
+  aggregation designed for NPU deployment, using average and learned projections
+  followed by a spatial attention mask.
+- **Space-to-depth convolution (`SPDConv`):** rearranges 2 x 2 spatial blocks into
+  channels, then applies a stride-1 convolution for factor-2 downsampling.
+- **DWT module (`DWTA2` in code):** extracts wavelet-filter features, generates
+  an attention map, and reweights the input before projecting output channels.
 
 ### Knowledge distillation
 
